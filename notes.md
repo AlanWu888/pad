@@ -114,10 +114,29 @@ None of this is automatic — it requires deliberately building the "only scan w
 - Latency is a direct function of which recognizers are enabled — regex/checksum recognizers (credit cards, SSNs, emails) are fast and cheap; the default NLP-based recognizer (spaCy) for contextual entities like names/addresses is meaningfully slower.
 - Self-hosting means you control scaling (horizontal pod autoscaling, batching, caching) but also own the operational burden — no AWS-managed throughput ceiling, but no AWS-managed elasticity either.
 - Same "don't re-scan the whole context every turn" problem applies if you run all conversation text through Presidio on every call — the fix is the same in spirit: only run Presidio over the new turn, not history that's already been checked.
+- "Free" is only the license — one cost estimate for self-hosting puts initial setup at 40–80 engineering hours plus 5–10 hours/month ongoing maintenance, which at a typical loaded engineering rate adds up to a real (if less visible) recurring cost. Worth weighing against Amazon Comprehend (below) as a fully-managed, much cheaper-per-character alternative if the requirement is PII detection specifically rather than Presidio's full customizability.
 
 ---
 
-## 6. Recommended approach for testing performance implications
+## 6. Alternative guardrail solutions worth considering
+
+Bedrock Guardrails / Presidio / LiteLLM was the starting brief, but they're not the only options — and a couple of these directly address the cost/scaling concern rather than just working around it.
+
+| Option | Type | What it is | Cost model | Why it might matter here |
+|---|---|---|---|---|
+| **Amazon Comprehend** (`DetectPii`/`ContainsPii`) | AWS-managed, PII-only | AWS's general-purpose NLP service, separate from Bedrock, also does PII detection/redaction | ~$0.0001 per 100-char unit (≈$0.001/1,000 chars) — roughly **100x cheaper per character than Bedrock's PII filter** ($0.10/1,000 chars). Free tier: 50,000 units (5M characters)/month per API. | If PII redaction is the main requirement (not content-safety/topics), this is a fully-managed, no-infra alternative to Presidio that's dramatically cheaper than Bedrock's built-in PII filter — worth benchmarking against Presidio's "free but you run it" model. |
+| **Azure AI Content Safety** | Cloud-managed, content-safety + PII | Azure's equivalent to Bedrock Guardrails | Billed per 1,000-character "text record," free tier of 5,000 records/month | Only relevant if there's any multi-cloud angle; otherwise not a natural fit for an AWS/Bedrock-centric stack. |
+| **NVIDIA NeMo Guardrails** | Open-source (Apache 2.0), self-hosted | Programmable rails (input/dialog/retrieval/execution/output) using a DSL called Colang; works with any LLM backend including Anthropic models, not tied to Bedrock | No per-call fee — compute only | Architecturally different: it can enforce *multi-turn dialog policy* (e.g. "don't let this conversation drift into X after Y was discussed"), not just point-in-time input/output filtering. Could be relevant if the concern is agentic behavior over a session, not just single-message content. |
+| **Guardrails AI** (open source) | Self-hosted Python library | Validates LLM output against schemas/validators (PII, toxicity, regex, semantic similarity) from a community hub, with re-ask/fix-up loops | Free — compute only | Best fit if structured-output correctness matters as much as safety (e.g. enforcing that tool-call arguments or generated code match an expected shape). |
+| **LLM Guard** (Protect AI, open source) | Self-hosted Python library | Chainable input/output scanners including PII anonymization; described as "zero-dependency" and fast | Free — compute only | Same category as Presidio but broader scanner set out of the box; can be self-hosted directly without going through LiteLLM's paid Enterprise tier (LiteLLM's *managed* LLM Guard integration is Enterprise-gated, but LLM Guard itself is free). |
+| **Lakera Guard** (commercial, now part of Check Point) | Managed API or self-hosted | Specializes in prompt-injection/jailbreak detection; already a supported LiteLLM guardrail provider | Request-based; reported low-thousands of $/month at 1–5M requests/month; self-hosted tier priced separately and higher | Vendor-reported latency (~5–50ms synchronous, ~10–15ms self-hosted same-region) is a useful benchmark to compare Bedrock Guardrails' actual measured latency against once testing is done. Strongest option if prompt-injection defense (distinct from PII/content-safety) is a priority — none of Bedrock/Presidio specialize in this the way Lakera does. |
+| **Claude itself as a moderation classifier** | LLM-as-judge, no new vendor | Anthropic's own guidance describes batching multiple messages into a single Claude call that returns a JSON verdict against custom-defined unsafe-content categories | Standard Claude token pricing (an extra inference call) | No new vendor/infra, and categories are defined in plain language rather than a fixed policy schema — but this is the *slowest and most expensive* tier of guardrail (a full LLM call per check), so it fits post-hoc/sampled moderation better than a synchronous per-turn gate on an agentic tool. |
+
+**An architectural alternative, not just a vendor one:** for a Claude Code/Cowork-shaped agent, it may be worth questioning whether *every* guardrail check needs to be synchronous and block the response at all. Options like async/post-hoc scanning (check after the response is already returned, alert/flag rather than block), or sampling (guardrail every Nth request or only above a risk threshold) trade a small amount of real-time coverage for a large reduction in cost and latency — and are one of the standard techniques cited for reducing guardrail-induced latency in general.
+
+---
+
+## 7. Recommended approach for testing performance implications
 
 Goal: get real numbers (latency and cost) for guardrails under Claude Code/Cowork-shaped traffic, rather than relying on vendor-quoted averages, before committing to an approach.
 
@@ -143,11 +162,24 @@ This gives a Confluence-ready before/after answer: "naive guardrail attachment c
 
 ---
 
-## 7. Open questions worth resolving before committing
+## 8. What's still unanswered
 
-- Does the target architecture route through LiteLLM, or call Bedrock/Presidio directly? This determines whether `GuardrailConverseContentBlock` scoping is available out of the box (native Bedrock SDK) or needs to be added to LiteLLM's guardrail hook config (check current LiteLLM support for `GuardrailConverseContentBlock` — as of this research it was an open feature request, not yet native).
-- What's the actual compliance requirement — is guardrail coverage on system-prompt/history genuinely needed (e.g. is untrusted content ever injected into history), or is user-input + final-output sufficient? This materially changes both cost and design.
-- Confirm current Bedrock Guardrails pricing and quota numbers against the [AWS pricing page](https://aws.amazon.com/bedrock/pricing/) and your account's service quotas before finalizing a cost model — both have changed within the past year and may change again.
+This research establishes the mechanics, pricing, and quotas — it does not establish real numbers for this specific workload, nor does it make the product/architecture decisions that the numbers depend on. Specifically still open:
+
+**Not yet measured (this is what the Section 7 test plan is for):**
+- Actual added latency (p50/p95/p99) of Bedrock Guardrails and Presidio against Claude Code/Cowork-shaped payloads. Everything in this doc about latency is either AWS's own general guidance or third-party vendor figures (e.g. Lakera's 5–50ms) — not a measurement of *this* workload.
+- Actual cost per session at realistic session lengths and policy combinations — Section 3's math is illustrative, not measured.
+- Where the account-wide TUPS/RPS throttling ceiling actually bites under concurrent Cowork/Claude Code sessions at expected production concurrency (we don't yet know the target concurrency to test against).
+- Detection quality (false positive/negative rates) for Bedrock's PII filter vs. Presidio vs. Comprehend on realistic content — this doc only covers speed and cost, not accuracy, and a faster/cheaper option that misses PII or over-blocks legitimate content isn't actually a win.
+
+**Design/architecture decisions this doc doesn't make:**
+- Whether the guardrail sits in front of Bedrock directly, or behind LiteLLM as the gateway — this determines whether `GuardrailConverseContentBlock` scoping (Section 4) is available natively today. As of this research, LiteLLM support for it was an open GitHub feature request, not shipped — worth confirming current status before assuming it's usable out of the box.
+- Whether synchronous, per-turn, full guardrail coverage is actually required, or whether async/post-hoc/sampled checking (Section 6) is acceptable for this use case — this is as much a risk-tolerance and compliance call as a technical one.
+- Whether the requirement is genuinely "guardrail the whole agent," or specifically "guardrail user input and final output" — untrusted content in the system prompt or intermediate tool output is a materially different (and rarer) threat model than untrusted user input, and the answer changes both cost and which of Section 6's alternatives make sense.
+
+**Numbers worth re-verifying close to decision time, since they move:**
+- Bedrock Guardrails pricing has already changed materially once (an ~85% cut in December 2024) and service quotas were doubled/increased 8x in February 2025 — both are plausibly different again by the time this is acted on. Re-check the [pricing page](https://aws.amazon.com/bedrock/pricing/) and your account's actual Service Quotas rather than trusting this document's numbers indefinitely.
+- Confirm the account's actual AWS region has the higher (50 RPS / 200 TUPS) quota — it was rolled out to US East (N. Virginia) and US West (Oregon) first and may not be universal.
 
 ---
 
@@ -165,3 +197,10 @@ This gives a Confluence-ready before/after answer: "naive guardrail attachment c
 - [LiteLLM: PII/PHI Masking with Presidio](https://docs.litellm.ai/docs/proxy/guardrails/pii_masking_v2)
 - [LiteLLM: Bedrock Guardrails integration](https://docs.litellm.ai/docs/proxy/guardrails/bedrock)
 - [LLM Guardrails Latency: Performance Impact and Optimization](https://modelmetry.com/blog/latency-of-llm-guardrails)
+- [Amazon Bedrock Guardrails reduces pricing by up to 85%](https://aws.amazon.com/about-aws/whats-new/2024/12/amazon-bedrock-guardrails-reduces-pricing-85-percent/)
+- [Amazon Comprehend Pricing](https://aws.amazon.com/comprehend/pricing)
+- [NVIDIA NeMo Guardrails (GitHub)](https://github.com/NVIDIA-NeMo/Guardrails)
+- [Guardrails AI](https://www.guardrailsai.com/)
+- [LLM Guard (Protect AI, GitHub)](https://github.com/protectai/llm-guard)
+- [Anthropic: API Safeguards Tools](https://support.claude.com/en/articles/9199617-api-safeguards-tools)
+- [Anthropic: Content moderation use-case guide](https://platform.claude.com/docs/en/about-claude/use-case-guides/content-moderation)
