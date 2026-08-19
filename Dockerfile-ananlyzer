@@ -19,13 +19,15 @@ ARG RECOGNIZER_REGISTRY_CONF_FILE=presidio_analyzer/conf/default_recognizers.yam
 
 ENV PIP_NO_CACHE_DIR=1 \
     UV_PROJECT_ENVIRONMENT=/app/venv \
+    VIRTUAL_ENV=/app/venv \
     NLP_CONF_FILE=${NLP_CONF_FILE} \
     ANALYZER_CONF_FILE=${ANALYZER_CONF_FILE} \
     RECOGNIZER_REGISTRY_CONF_FILE=${RECOGNIZER_REGISTRY_CONF_FILE}
 
 COPY --from=upstream /app/pyproject.toml /app/uv.lock ./
 
-RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project
+RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project \
+    && uv pip install pip
 
 # Check the resolved cryptography version against CVE-2026-69249 (fixed
 # 49.0.0) / CVE-2026-69247 (fixed 50.0.0) before deciding whether this
@@ -39,7 +41,7 @@ COPY --from=upstream /app/${RECOGNIZER_REGISTRY_CONF_FILE} ./${RECOGNIZER_REGIST
 COPY --from=upstream /app/install_nlp_models.py ./
 
 RUN /app/venv/bin/python install_nlp_models.py \
-    --conf_file ${NLP_CONF_FILE} \
+    --nlp_conf_file ${NLP_CONF_FILE} \
     --analyzer_conf_file ${ANALYZER_CONF_FILE}
 
 # --- Runtime: minimal Chainguard/Wolfi image — no shell, no package manager ---
