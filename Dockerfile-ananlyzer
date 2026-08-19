@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+
+# Used only as a source for the exact app code, config, and pinned
+# dependency versions Presidio ships at 2.2.364 — none of its OS
+# layers (Debian, perl-base, apt, etc.) end up in the final image.
+FROM ghcr.io/data-privacy-stack/presidio-analyzer:2.2.364 AS upstream
+
+# --- Build: resolve the same locked deps fresh against Chainguard's Python/Wolfi,
+#     then download the spaCy model the default config points at ---
+FROM cgr.dev/chainguard/python:latest-dev AS build
+
+USER root
+
+WORKDIR /app
+
+ARG NLP_CONF_FILE=presidio_analyzer/conf/default.yaml
+ARG ANALYZER_CONF_FILE=presidio_analyzer/conf/default_analyzer.yaml
+ARG RECOGNIZER_REGISTRY_CONF_FILE=presidio_analyzer/conf/default_recognizers.yaml
+
+ENV PIP_NO_CACHE_DIR=1 \
+    UV_PROJECT_ENVIRONMENT=/app/venv \
+    NLP_CONF_FILE=${NLP_CONF_FILE} \
+    ANALYZER_CONF_FILE=${ANALYZER_CONF_FILE} \
+    RECOGNIZER_REGISTRY_CONF_FILE=${RECOGNIZER_REGISTRY_CONF_FILE}
+
+COPY --from=upstream /app/pyproject.toml /app/uv.lock ./
+
+RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project
+
+# Check the resolved cryptography version against CVE-2026-69249 (fixed
+# 49.0.0) / CVE-2026-69247 (fixed 50.0.0) before deciding whether this
+# line is needed here — analyzer doesn't pin it directly like anonymizer
+# does, so the lock may already resolve to a patched version.
+# RUN uv pip install --no-cache "cryptography>=50.0.0"
+
+COPY --from=upstream /app/${NLP_CONF_FILE} ./${NLP_CONF_FILE}
+COPY --from=upstream /app/${ANALYZER_CONF_FILE} ./${ANALYZER_CONF_FILE}
+COPY --from=upstream /app/${RECOGNIZER_REGISTRY_CONF_FILE} ./${RECOGNIZER_REGISTRY_CONF_FILE}
+COPY --from=upstream /app/install_nlp_models.py ./
+
+RUN /app/venv/bin/python install_nlp_models.py \
+    --conf_file ${NLP_CONF_FILE} \
+    --analyzer_conf_file ${ANALYZER_CONF_FILE}
+
+# --- Runtime: minimal Chainguard/Wolfi image — no shell, no package manager ---
+FROM cgr.dev/chainguard/python:latest
+
+WORKDIR /app
+
+COPY --from=build /app/venv /app/venv
+COPY --from=upstream /app/app.py /app/logging.ini ./
+COPY --from=upstream /app/presidio_analyzer ./presidio_analyzer
+
+ENV PATH="/app/venv/bin:$PATH" \
+    GUNICORN_CMD_ARGS="--workers 1 --bind 0.0.0.0:3000"
+
+EXPOSE 3000
+
+USER nonroot
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health', timeout=2)"]
+
+ENTRYPOINT ["gunicorn", "app:create_app()"]
