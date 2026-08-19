@@ -17,7 +17,13 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 COPY --from=upstream /app/pyproject.toml /app/uv.lock ./
 
-RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project
+# --locked installs exactly what Presidio's own lockfile pins; the
+# follow-up upgrade patches cryptography past Presidio's own
+# `<49.0.0` cap, which predates the fixes for CVE-2026-69249
+# (path-building DoS, fixed 49.0.0) and CVE-2026-69247 (PKCS#7
+# Bleichenbacher oracle, fixed 50.0.0).
+RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project \
+    && uv pip install --no-cache "cryptography>=50.0.0"
 
 # --- Runtime: minimal Chainguard/Wolfi image — no shell, no package manager ---
 FROM cgr.dev/chainguard/python:latest
