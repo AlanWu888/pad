@@ -1,23 +1,51 @@
 # syntax=docker/dockerfile:1
 
-# Used only as a source for the exact app code, config, and pinned
-# dependency versions Presidio ships at 2.2.364 — none of its OS
-# layers (Debian, perl-base, apt, etc.) end up in the final image.
+# =============================================================================
+# Presidio Analyzer on Chainguard/Wolfi
+#
+# Design notes for reviewers:
+#   * Upstream's pyproject.toml + uv.lock are the dependency source of truth,
+#     but they are re-locked here for two packages with known advisories.
+#   * Security floors live in constraints.txt and are enforced through
+#     PIP_CONSTRAINT / UV_CONSTRAINT so that *nested* resolvers obey them —
+#     notably the pip that spacy.cli.download spawns.
+#   * The build FAILS if the floors are not met in the final venv. A pin that
+#     silently doesn't apply is worse than no pin at all.
+# =============================================================================
+
+
+# --- uv, pinned ---------------------------------------------------------------
+# Pinning the resolver makes the build reproducible and removes the assumption
+# that the Chainguard dev image ships a particular uv version.
+# TODO: replace `latest` with an explicit tag (e.g. 0.9.5) before merging.
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
+
+# --- Upstream: source of app code, config, and the locked dependency set ------
+# None of its OS layers (Debian, perl-base, apt, ...) reach the final image.
 FROM ghcr.io/data-privacy-stack/presidio-analyzer:2.2.364 AS upstream
 
-# --- Build: resolve the same locked deps fresh against Chainguard's Python/Wolfi,
-#     then download the spaCy model the default config points at ---
+
+# --- Build --------------------------------------------------------------------
 FROM cgr.dev/chainguard/python:latest-dev AS build
 
 USER root
-
 WORKDIR /app
+
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ARG NLP_CONF_FILE=presidio_analyzer/conf/default.yaml
 ARG ANALYZER_CONF_FILE=presidio_analyzer/conf/default_analyzer.yaml
 ARG RECOGNIZER_REGISTRY_CONF_FILE=presidio_analyzer/conf/default_recognizers.yaml
 
+# constraints.txt must be in place BEFORE any resolver runs, and PIP_CONSTRAINT
+# must stay set for the whole stage — install_nlp_models.py invokes pip
+# indirectly and would otherwise be free to reintroduce a vulnerable version.
+COPY constraints.txt /app/constraints.txt
+
 ENV PIP_NO_CACHE_DIR=1 \
+    PIP_CONSTRAINT=/app/constraints.txt \
+    UV_CONSTRAINT=/app/constraints.txt \
     UV_PROJECT_ENVIRONMENT=/app/venv \
     VIRTUAL_ENV=/app/venv \
     NLP_CONF_FILE=${NLP_CONF_FILE} \
@@ -26,22 +54,24 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 COPY --from=upstream /app/pyproject.toml /app/uv.lock ./
 
-# CVE-2025-47273: setuptools path traversal, fixed in 78.1.1.
-# GHSA-6v7p-g79w-8964: msgpack OOB read / DoS on Unpacker reuse, fixed in 1.2.1.
-# Both are transitive deps landing in the venv; pin them to patched
-# versions so the copied /app/venv is clean. If uv.lock hard-pins either
-# below these versions, update the lock upstream (uv lock --upgrade-package)
-# instead of overriding here, to keep the build reproducible.
-RUN uv sync --locked --no-cache --no-default-groups --extra server --no-install-project \
-    && uv pip install pip \
-    && uv pip install --no-cache "setuptools>=78.1.1" "msgpack>=1.2.1"
+# Re-resolve only the two advisory packages, then assert the lock is consistent
+# with pyproject.toml before installing.
+#
+# --upgrade-package raises each package to the newest version its dependents
+# permit. If a dependent *caps* one of them below the floor, the verification
+# gate further down fails the build — which is the correct outcome. Fix it by
+# bumping the capping dependency, not by force-installing over the top.
+#
+# If you need a hard declarative floor at resolve time rather than a nudge, add
+# to pyproject.toml instead:
+#     [tool.uv]
+#     constraint-dependencies = ["setuptools>=78.1.1", "msgpack>=1.2.1"]
+RUN uv lock --upgrade-package setuptools --upgrade-package msgpack \
+ && uv sync --locked --no-cache --no-default-groups --extra server --no-install-project
 
-# Check the resolved cryptography version against CVE-2026-69249 (fixed
-# 49.0.0) / CVE-2026-69247 (fixed 50.0.0) before deciding whether this
-# line is needed here — analyzer doesn't pin it directly like anonymizer
-# does, so the lock may already resolve to a patched version.
-# RUN uv pip install --no-cache "cryptography>=50.0.0"
-
+# --- spaCy model download -----------------------------------------------------
+# This step runs pip inside /app/venv via spacy.cli.download. PIP_CONSTRAINT
+# above is what keeps it from walking the floors back.
 COPY --from=upstream /app/${NLP_CONF_FILE} ./${NLP_CONF_FILE}
 COPY --from=upstream /app/${ANALYZER_CONF_FILE} ./${ANALYZER_CONF_FILE}
 COPY --from=upstream /app/${RECOGNIZER_REGISTRY_CONF_FILE} ./${RECOGNIZER_REGISTRY_CONF_FILE}
@@ -51,16 +81,65 @@ RUN /app/venv/bin/python install_nlp_models.py \
     --nlp_conf_file ${NLP_CONF_FILE} \
     --analyzer_conf_file ${ANALYZER_CONF_FILE}
 
-# --- Runtime: minimal Chainguard/Wolfi image — no shell, no package manager ---
+# --- Gate: fail the build if the venv does not meet the advisory floors -------
+# Runs LAST, after every step that can mutate site-packages. Also writes a
+# manifest of exactly what shipped, for correlating against scanner output.
+RUN /app/venv/bin/python - <<'PY'
+import re
+import sys
+from importlib.metadata import distributions
+
+FLOORS = {
+    "setuptools": ("78.1.1", "CVE-2025-47273"),
+    "msgpack": ("1.2.1", "GHSA-6v7p-g79w-8964"),
+}
+
+
+def as_tuple(version):
+    """Coarse numeric compare. Adequate for simple X.Y.Z advisory floors."""
+    return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+
+
+installed = {}
+for dist in distributions():
+    name = (dist.metadata["Name"] or "").lower().replace("_", "-")
+    if name:
+        installed[name] = dist.version
+
+failures = []
+print("Advisory floor check:")
+for package, (floor, advisory) in FLOORS.items():
+    found = installed.get(package)
+    if found is None:
+        print(f"  {package:<12} absent — nothing to patch ({advisory})")
+        continue
+    ok = as_tuple(found) >= as_tuple(floor)
+    print(f"  {package:<12} {found:<10} floor {floor:<10} "
+          f"{'OK' if ok else 'FAIL'}  {advisory}")
+    if not ok:
+        failures.append(f"{package}=={found} is below {floor} ({advisory})")
+
+if failures:
+    sys.exit("BUILD FAILED — advisory floors not met:\n  " + "\n  ".join(failures))
+
+print("All advisory floors satisfied.")
+PY
+
+RUN uv pip freeze --python /app/venv/bin/python > /app/venv-manifest.txt
+
+
+# --- Runtime: minimal Wolfi image — no shell, no package manager --------------
 FROM cgr.dev/chainguard/python:latest
 
 WORKDIR /app
 
 COPY --from=build /app/venv /app/venv
+COPY --from=build /app/venv-manifest.txt /app/venv-manifest.txt
 COPY --from=upstream /app/app.py /app/logging.ini ./
 COPY --from=upstream /app/presidio_analyzer ./presidio_analyzer
 
 ENV PATH="/app/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
     GUNICORN_CMD_ARGS="--workers 1 --bind 0.0.0.0:3000"
 
 EXPOSE 3000
